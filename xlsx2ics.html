@@ -1,0 +1,405 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+  <title>希悦课表日程转换器</title>
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <div class="container">
+    <h1>希悦课表日程转换器</h1>
+    <p class="subtitle">将Excel课表转换为ICS日历文件</p>
+    
+    <div class="notice">
+      <strong>使用提示：</strong><br>
+      1. 在希悦中找到第一周的周一日期<br>
+      2. Excel文件等到选课全部结束之后再下载<br>
+      3. 下载时要尽量切换到学期中的周数（保证稳定性）<br>
+      4. 如果当前周某一天某一节课没有/某一天不上课，那导出的excel就只有剩下的内容
+    </div>
+
+    <div class="form-row">
+      <div class="form-group">
+        <label>上传 Excel 文件（支持 .xlsx）</label>
+        <input id="file" type="file" accept=".xlsx,.xls,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" />
+        <div class="small muted">请选择从希悦导出的Excel课表文件。</div>
+      </div>
+      <div class="form-group">
+        <label>第一周「周一」日期</label>
+        <input id="monday" type="date" />
+        <div class="small muted">示例：2025-02-17</div>
+      </div>
+    </div>
+
+    <div class="form-group">
+      <label>总周数（用于未标注"每周[ ]"的格子）</label>
+      <input id="totalWeeks" type="number" min="1" max="30" value="21" />
+    </div>
+
+    <div class="form-row">
+      <div class="form-group">
+        <div class="checkbox-group">
+          <input id="includeAttendance" type="checkbox" />
+          <label for="includeAttendance">包含「入校考勤」行</label>
+        </div>
+      </div>
+      <div class="form-group">
+        <div class="checkbox-group">
+          <input id="includeLunch" type="checkbox" />
+          <label for="includeLunch">包含「中午」行（午休）</label>
+        </div>
+      </div>
+    </div>
+
+    <div class="form-row">
+      <div class="form-group">
+        <label>导出文件名（不含后缀）</label>
+        <input id="icsName" type="text" placeholder="我的课表_2024-2025第二学期" />
+      </div>
+      <div class="form-group">
+        <button id="run" class="btn">生成ICS文件</button>
+        <a id="download" class="btn secondary" href="#" download style="display:none">下载 ICS</a>
+      </div>
+    </div>
+
+    <div id="log" class="status" style="display:none"></div>
+  </div>
+
+  <div class="usage-tips">
+    <h3>使用说明</h3>
+    <ul>
+      <li>生成的 <strong>ICS 文件</strong>可直接导入 Apple 日历、Google Calendar、Outlook 等日历应用</li>
+      <li>系统默认使用 <strong>Asia/Shanghai</strong> 时区（北京时间）</li>
+      <li>如遇到时间显示异常，请检查设备的系统时区设置</li>
+      <li>建议在选课完成后的<strong>学期中期</strong>下载Excel文件，确保数据完整性</li>
+    </ul>
+  </div>
+
+  <!-- 依赖：SheetJS 解析 Excel；Luxon 处理时区与格式化 -->
+  <!-- 使用本地文件，避免CDN网络问题 -->
+  <script src="./xlsx.full.min.js"></script>
+  <script src="./luxon.min.js"></script>
+  <script>
+  (function(){
+    const log = (msg, cls="") => {
+      const el = document.getElementById('log');
+      const line = document.createElement('div');
+      if (cls) line.className = cls;
+      line.textContent = msg;
+      el.appendChild(line);
+      // keep at most 200 lines
+      if (el.childNodes.length > 200) el.removeChild(el.firstChild);
+    };
+
+    const WEEKDAY_MAP = {
+      "星期一": 0, "周一": 0, "Mon": 0, "Monday": 0,
+      "星期二": 1, "周二": 1, "Tue": 1, "Tuesday": 1,
+      "星期三": 2, "周三": 2, "Wed": 2, "Wednesday": 2,
+      "星期四": 3, "周四": 3, "Thu": 3, "Thursday": 3,
+      "星期五": 4, "周五": 4, "Fri": 4, "Friday": 4,
+      "星期六": 5, "周六": 5, "Sat": 5, "Saturday": 5,
+      "星期日": 6, "周日": 6, "周天": 6, "Sun": 6, "Sunday": 6
+    };
+
+    function detectHeaderAndColumns(sheetAOA){
+      // 查找包含“星期一”的表头行
+      for (let r = 0; r < Math.min(20, sheetAOA.length); r++) {
+        const row = sheetAOA[r].map(x => (x ?? "").toString().trim());
+        const hasMon = row.some(c => ["星期一","周一","Monday","Mon"].includes(c));
+        if (hasMon) {
+          // 记录每个星期列的索引
+          const dayCols = [];
+          row.forEach((cell, idx) => {
+            const key = Object.keys(WEEKDAY_MAP).find(k => k === cell);
+            if (key !== undefined) dayCols.push({ day: key, colIndex: idx, weekdayOffset: WEEKDAY_MAP[key] });
+          });
+          return { headerRow: r, dayCols };
+        }
+      }
+      return null;
+    }
+
+    function extractTimeslot(str){
+      // 从 "第3节 \n09:55 - 10:35" 或 "入校考勤 \n07:55 - 08:00" 里抓时间
+      if (!str) return null;
+      const s = String(str);
+      const m = s.match(/(\d{1,2}:\d{2})\s*-\s*(\d{1,2}:\d{2})/);
+      if (!m) return null;
+      // 统一成两位小时
+      const pad = t => {
+        const [h, min] = t.split(":");
+        return (h.length===1 ? "0"+h : h) + ":" + min;
+      };
+      return { start: pad(m[1]), end: pad(m[2]), label: s.split(/\s/)[0] || "" };
+    }
+
+    function parseWeeksFromCell(text){
+      // 支持多段："每周[1-21] 每周[4-5] 每周[7-7]"
+      const weeks = [];
+      const s = (text||"").toString();
+      const re = /每周\[(\d+)\s*-\s*(\d+)\]/g;
+      let m;
+      while ((m = re.exec(s)) !== null) {
+        const a = parseInt(m[1], 10), b = parseInt(m[2], 10);
+        const from = Math.min(a,b), to = Math.max(a,b);
+        for (let w = from; w <= to; w++) weeks.push(w);
+      }
+      return Array.from(new Set(weeks)).sort((a,b)=>a-b);
+    }
+
+    function tryExtractLocation(text){
+      const s = (text||"").toString().replace(/\\n/g, " ").replace(/\s+/g, " ").trim();
+      // 常见“楼+房间”片段，如 “西楼W505 / 东楼E203 / 南楼S101 / 北楼N302 / 科学楼308”
+      const patternList = [
+        /[东西南北中]\s*楼\s*\S{1,8}/i,
+        /[ENSW东南西北]\s*楼?\s*[A-Z]?\d{2,4}/i,
+        /\b[A-Z]\d{2,4}\b/,              // W505 / E203
+        /\d{3,4}[教]室?/,                // 308教室 / 308室
+      ];
+      for (const re of patternList) {
+        const m = s.match(re);
+        if (m) return m[0].trim();
+      }
+      return "";
+    }
+
+    function firstLine(text){
+      const s = (text||"").toString();
+      const parts = s.split(/\\n|\r\n/);
+      return (parts[0]||"").trim();
+    }
+
+    function normalizeCellText(v){
+      if (v == null) return "";
+      // SheetJS AOA 里换行常见为 "\n"
+      return String(v).replace(/\r\n/g, "\n").trim();
+    }
+
+    // 生成 ICS 内容（以 TZID 标注本地时区；多数日历可直接识别）
+    function buildICS(events, tzid){
+      const escapeICS = (s) => String(s||"")
+        .replace(/\\/g, "\\\\")
+        .replace(/\n/g, "\\n")
+        .replace(/,/g, "\\,")
+        .replace(/;/g, "\\;");
+
+      const fmtLocal = (dt) => {
+        // dt 为 luxon DateTime（本地时区）
+        return dt.toFormat("yyyyLLdd'T'HHmmss");
+      };
+
+      const lines = [
+        "BEGIN:VCALENDAR",
+        "PRODID:-//xlsx2ics//CN//",
+        "VERSION:2.0",
+        "CALSCALE:GREGORIAN"
+        // 可选添加 VTIMEZONE，但多数客户端对 TZID 格式已能识别
+      ];
+
+      for (const ev of events) {
+        lines.push("BEGIN:VEVENT");
+        if (tzid && tzid !== "UTC") {
+          lines.push(`DTSTART;TZID=${tzid}:${fmtLocal(ev.start)}`);
+          lines.push(`DTEND;TZID=${tzid}:${fmtLocal(ev.end)}`);
+        } else {
+          // UTC 直接 Z
+          lines.push("DTSTART:" + ev.start.toUTC().toFormat("yyyyLLdd'T'HHmmss'Z'"));
+          lines.push("DTEND:" + ev.end.toUTC().toFormat("yyyyLLdd'T'HHmmss'Z'"));
+        }
+        lines.push("DTSTAMP:" + luxon.DateTime.utc().toFormat("yyyyLLdd'T'HHmmss'Z'"));
+        lines.push("UID:" + escapeICS(ev.uid));
+        if (ev.title) lines.push("SUMMARY:" + escapeICS(ev.title));
+        if (ev.location) lines.push("LOCATION:" + escapeICS(ev.location));
+        if (ev.description) lines.push("DESCRIPTION:" + escapeICS(ev.description));
+        lines.push("END:VEVENT");
+      }
+
+      lines.push("END:VCALENDAR");
+      return lines.join("\r\n");
+    }
+
+    function arrayBufferToUint8Array(ab){
+      return new Uint8Array(ab);
+    }
+
+    document.getElementById("run").addEventListener("click", async () => {
+      const fileInput = document.getElementById("file");
+      const mondayStr = document.getElementById("monday").value;
+      const tzid = "Asia/Shanghai"; // 默认使用北京时间
+      const totalWeeks = parseInt(document.getElementById("totalWeeks").value || "21", 10);
+      const includeAttendance = document.getElementById("includeAttendance").checked;
+      const includeLunch = document.getElementById("includeLunch").checked;
+      const titleOnlyCourseName = true; // 默认启用课程名称简化
+      const icsName = (document.getElementById("icsName").value || "课表").trim();
+
+      document.getElementById("log").innerHTML = ""; // clear
+      
+      // 检查必要的库是否已加载
+      if (typeof XLSX === 'undefined') {
+        log("错误：XLSX库未能加载。请检查网络连接或刷新页面重试。", "err");
+        return;
+      }
+      if (typeof luxon === 'undefined') {
+        log("错误：Luxon库未能加载。请检查网络连接或刷新页面重试。", "err");
+        return;
+      }
+      
+      if (!fileInput.files || !fileInput.files[0]) { log("请先选择 Excel 文件。", "err"); return; }
+      if (!mondayStr) { log("请填写第一周周一日期。", "err"); return; }
+
+      const monday = luxon.DateTime.fromISO(mondayStr, { zone: tzid });
+      if (!monday.isValid) { log("无效的日期或时区。", "err"); return; }
+      if (monday.weekday !== 1) {
+        log("⚠️ 提示：你选择的日期并非周一（weekday="+ monday.weekday +"）。将按此日期作为“第一周周一”继续。", "warn");
+      }
+
+      const file = fileInput.files[0];
+      const ab = await file.arrayBuffer();
+      const data = arrayBufferToUint8Array(ab);
+
+      // 使用 SheetJS 解析 Excel 文件
+      let wb;
+      try {
+        wb = XLSX.read(data, { type: "array" });
+      } catch (e) {
+        log("解析 Excel 失败：" + e.message, "err");
+        return;
+      }
+      const firstSheetName = wb.SheetNames[0];
+      const ws = wb.Sheets[firstSheetName];
+      const aoa = XLSX.utils.sheet_to_json(ws, { header:1, raw:false, defval: "" });
+      log("工作表：" + firstSheetName + "，尺寸 " + aoa.length + "×" + (aoa[0]?.length || 0), "ok");
+
+      // 定位表头与星期列
+      const hd = detectHeaderAndColumns(aoa);
+      if (!hd) { log("未找到表头行（需要包含“星期一/二/三/四/五”）。", "err"); return; }
+      log("表头行索引：" + hd.headerRow + "；检测到星期列：" + hd.dayCols.map(d => d.day + "@" + d.colIndex).join(", "), "ok");
+
+      // 收集每行的节次时间（来自第 1 列）
+      const times = []; // { rowIndex, start, end, label, raw }
+      for (let r = hd.headerRow + 1; r < aoa.length; r++) {
+        const raw = (aoa[r][0] ?? "").toString().trim();
+        if (!raw) continue;
+        const tt = extractTimeslot(raw);
+        if (tt) {
+          times.push({ rowIndex: r, start: tt.start, end: tt.end, label: raw.split(/\s/)[0] || "", raw });
+        } else {
+          // 非时间行不计入（例如空白/说明），但保留用于筛选
+          times.push({ rowIndex: r, start: null, end: null, label: raw, raw });
+        }
+      }
+      log("检测到时段行数：" + times.filter(t => t.start).length + "（总行 " + times.length + "）。", "ok");
+
+      // 根据用户选项排除某些行
+      function shouldSkipByLabel(labelRaw){
+        const label = (labelRaw || "").toString();
+        if (!includeAttendance && /入校考勤/.test(label)) return true;
+        if (!includeLunch && /中午/.test(label)) return true;
+        return false;
+      }
+
+      // 构建事件
+      const events = [];
+      const tz = tzid || "Asia/Shanghai";
+
+      for (const day of hd.dayCols) {
+        const wdOffset = day.weekdayOffset; // 0..6
+        for (const t of times) {
+          // 没有时间的不生成
+          if (!t.start || !t.end) continue;
+          if (shouldSkipByLabel(t.raw)) continue;
+
+          const cellText = normalizeCellText(aoa[t.rowIndex][day.colIndex]);
+          if (!cellText) continue;
+
+          let title = firstLine(cellText) || "课程";
+          
+          // 如果选择了仅显示课程名称，则进一步处理标题
+           if (titleOnlyCourseName) {
+             // 移除常见的非课程信息，如教师名、教室信息等
+             title = title.replace(/\s*\([^)]*\)\s*/g, '') // 移除括号内容
+                         .replace(/\s*（[^）]*）\s*/g, '') // 移除中文括号内容
+                         .replace(/\s*老师\s*/g, '') // 移除"老师"字样
+                         .replace(/\s*教师\s*/g, '') // 移除"教师"字样
+                         .replace(/\s*[A-Z]\d+\s*/g, '') // 移除教室编号如"A101"
+                         .replace(/\s*[东西南北中]楼\S*\s*/g, '') // 移除楼栋信息
+                         .trim();
+             if (!title) title = "课程"; // 如果处理后为空，使用默认值
+           }
+          
+          const weeks = parseWeeksFromCell(cellText);
+          const useWeeks = (weeks.length ? weeks : Array.from({length: totalWeeks}, (_,i)=> i+1));
+
+          const location = tryExtractLocation(cellText);
+          const description = cellText;
+
+          // 构造每一周的事件
+          for (const wk of useWeeks) {
+            const dateBase = monday.plus({ days: wdOffset, weeks: (wk-1) }); // 当周该星期的日期
+            const [sh, sm] = t.start.split(":").map(x=>parseInt(x,10));
+            const [eh, em] = t.end.split(":").map(x=>parseInt(x,10));
+            const startDT = dateBase.set({ hour: sh, minute: sm, second: 0, millisecond: 0 });
+            const endDT   = dateBase.set({ hour: eh, minute: em, second: 0, millisecond: 0 });
+
+            // UID：标题+日期时间+列行+随机
+            const uid = [
+              "xlsx2ics",
+              title.replace(/\s+/g,"_").slice(0,40),
+              dateBase.toFormat("yyyyLLdd"),
+              t.rowIndex, day.colIndex,
+              Math.random().toString(36).slice(2,8)
+            ].join("-");
+
+            events.push({ title, location, description, start: startDT, end: endDT, uid });
+          }
+        }
+      }
+
+      if (!events.length) {
+        log("未生成任何事件。请检查：是否勾选了过多过滤项、表头/时间格式是否被识别、课程格是否为空。", "err");
+        return;
+      }
+
+      // 统计
+      const byDay = new Map();
+      for (const ev of events) {
+        const key = ev.start.toFormat("ccc");
+        byDay.set(key, (byDay.get(key)||0)+1);
+      }
+      log("已生成事件：" + events.length + " 条；分布：" + Array.from(byDay.entries()).map(([k,v]) => k+":"+v).join("，"), "ok");
+
+      // 导出
+      const ics = buildICS(events, tz);
+      const blob = new Blob([ics], { type: "text/calendar;charset=utf-8" });
+      const url = URL.createObjectURL(blob);
+      const a = document.getElementById("download");
+      a.href = url;
+      a.download = (icsName || "课表") + ".ics";
+      a.style.display = "inline-flex";
+      a.textContent = "下载 ICS（"+ events.length +" 条）";
+      log("ICS 生成完成，可点击按钮下载。", "ok");
+    });
+    // 页面加载完成后检查库是否正确加载
+    window.addEventListener('load', function() {
+      setTimeout(function() {
+        const runBtn = document.getElementById('run');
+        if (typeof XLSX === 'undefined') {
+          log('警告：XLSX库加载失败，无法解析Excel文件。请刷新页面重试。', 'warn');
+          if (runBtn) runBtn.disabled = true;
+        } else {
+          log('XLSX库加载成功', 'ok');
+        }
+        
+        if (typeof luxon === 'undefined') {
+          log('警告：Luxon库加载失败，无法处理日期时间。请刷新页面重试。', 'warn');
+          if (runBtn) runBtn.disabled = true;
+        } else {
+          log('Luxon库加载成功', 'ok');
+        }
+      }, 1000); // 延迟1秒检查，确保所有脚本都有时间加载
+    });
+  })();
+  </script>
+</body>
+</html>
