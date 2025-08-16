@@ -315,18 +315,20 @@
 
           let title = firstLine(cellText) || "课程";
           
-          // 如果选择了仅显示课程名称，则进一步处理标题
-           if (titleOnlyCourseName) {
-             // 移除常见的非课程信息，如教师名、教室信息等
-             title = title.replace(/\s*\([^)]*\)\s*/g, '') // 移除括号内容
-                         .replace(/\s*（[^）]*）\s*/g, '') // 移除中文括号内容
-                         .replace(/\s*老师\s*/g, '') // 移除"老师"字样
-                         .replace(/\s*教师\s*/g, '') // 移除"教师"字样
-                         .replace(/\s*[A-Z]\d+\s*/g, '') // 移除教室编号如"A101"
-                         .replace(/\s*[东西南北中]楼\S*\s*/g, '') // 移除楼栋信息
-                         .trim();
-             if (!title) title = "课程"; // 如果处理后为空，使用默认值
-           }
+          // 默认启用课程名称简化，仅显示课程名称
+          if (titleOnlyCourseName) {
+            // 移除括号内容（通常是教师、教室信息）
+            title = title.replace(/[（(][^）)]*[）)]/g, '').trim();
+            // 移除常见的教师姓名模式（中文姓名通常2-4个字符）
+            title = title.replace(/[\u4e00-\u9fa5]{2,4}老师?/g, '').trim();
+            // 移除教室信息（如：A101、教学楼等）
+            title = title.replace(/[A-Z]?\d+[A-Z]?室?/g, '').trim();
+            title = title.replace(/教学楼|实验楼|图书馆/g, '').trim();
+            // 移除多余的空格和标点
+            title = title.replace(/[\s,，;；]+/g, ' ').trim();
+            
+            if (!title) title = "课程";
+          }
           
           const weeks = parseWeeksFromCell(cellText);
           const useWeeks = (weeks.length ? weeks : Array.from({length: totalWeeks}, (_,i)=> i+1));
